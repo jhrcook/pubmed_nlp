@@ -105,7 +105,7 @@ pubtatoes <- purrr::map(bib$pmid, pubmed.mineR::pubtator_function) %>%
     bind_rows()
 ```
 
-    #> # A tibble: 3,717 x 3
+    #> # A tibble: 3,713 x 3
     #>    PMID     field     val              
     #>    <chr>    <chr>     <chr>            
     #>  1 30535440 Genes     ERK1/2           
@@ -118,7 +118,7 @@ pubtatoes <- purrr::map(bib$pmid, pubmed.mineR::pubtator_function) %>%
     #>  8 30103709 Diseases  CRC              
     #>  9 30103709 Diseases  tumour           
     #> 10 30103709 Chemicals irinotecan       
-    #> # … with 3,707 more rows
+    #> # … with 3,703 more rows
 
 There were a few cleaning steps needed. These were completed in the
 following pipeline - I tried to add comments wherever I could.
@@ -179,7 +179,7 @@ pubtatoes %>%
          title = "Frequency of genes in articles")
 ```
 
-![](README_files/figure-gfm/unnamed-chunk-1-1.png)<!-- -->
+![](README_files/figure-gfm/clean_pubtato-1.png)<!-- -->
 
 As expected, there are a lot of genes in the MAPK pathway,
 PI3Kalpha-Akt, oncogenes, and tumor supressors. Funny enough, a small
@@ -189,3 +189,172 @@ list, including *JARID2*, *EZH2*, and *SUZ12*. Interestingly, though,
 PRC1 is on the list, but the term PRC2, is not. I wonder if this is just
 due to the differences in how people discuss the two related complexes
 in papers.
+
+`#> TODO: more simple plots to explore the data further`
+
+## Disease Network
+
+For the files with at least one disease and other entity (gene,
+chemical, etc.), I drew a link between them to create a disease network
+for my library. I used the
+[‘tidygraph’](https://cran.r-project.org/web/packages/tidygraph/index.html)
+package for handling the graph.
+
+``` r
+# remove the NULL values of a list
+remove_nulls <- function(x) {
+    idx <- purrr::map_lgl(x, is.null)
+    return(x[!idx])
+}
+
+# make a graph for an individual file
+file_disease_gene_graph <- function(PMID, data) {
+    # get disases and genes for the file
+    diseases <- data %>% filter(field == "Diseases") %>% u_pull(val) %>% unlist()
+    genes <- data %>% filter(field != "Diseases") %>% u_pull(val) %>% unlist()
+    
+    # check there are both dieases and genes
+    if (length(diseases) < 1 | length(genes) < 1) {
+        return(NULL)
+    }
+    
+    # construct the graph
+    gr <- expand.grid(diseases, genes) %>% 
+        as_tibble() %>%
+        mutate(pmid = !!PMID) %>%
+        as_tbl_graph(directed = TRUE)
+    return(gr)
+}
+
+pub_gr <- pubtatoes %>% 
+    group_by(PMID) %>% 
+    tidyr::nest() %>%
+    pmap(file_disease_gene_graph) %>% 
+    remove_nulls() %>% 
+    recursive_graph_join()
+```
+
+    #> # A tbl_graph: 1291 nodes and 6650 edges
+    #> #
+    #> # A directed multigraph with 13 components
+    #> #
+    #> # Node Data: 1,291 x 1 (active)
+    #>   name             
+    #>   <chr>            
+    #> 1 cancer           
+    #> 2 ERK1/2           
+    #> 3 colorectal cancer
+    #> 4 CRC              
+    #> 5 tumour           
+    #> 6 AKT              
+    #> # … with 1,285 more rows
+    #> #
+    #> # Edge Data: 6,650 x 3
+    #>    from    to pmid    
+    #>   <int> <int> <chr>   
+    #> 1     1     2 30535440
+    #> 2     3     6 30103709
+    #> 3     4     6 30103709
+    #> # … with 6,647 more rows
+
+I then annotated the nodes as either a disease or gene.
+
+``` r
+tt <- pubtatoes %>% select(field, val) %>% unique()
+names(tt) <- c("type", "name")
+pub_gr <- pub_gr %N>%
+    left_join(tt, by = "name")
+```
+
+    #> Error in `vertex.attributes<-`(graph, index = index, value = value): Invalid attribute value length, must match number of vertices
+
+This resulted in an error. Normally, I would fix this and no one would
+see the error, but the cause was too good not to share…
+
+I have used ‘tidygraph’ long enough to know that this error is thrown
+when merging with nodes when there are some nodes being mapped to
+multiple rows in the joining data table (`tt` in this case). Therefore,
+I isolated the values in `tt$name` with more than one entry.
+
+``` r
+tt %>%
+    mutate(name = fct_lump_min(name, min=2)) %>%  # lump values with <2 entries
+    filter(name != "Other") %>%  # filter out the renamed values
+    arrange(name)  # arrange by `name` column
+```
+
+    #> # A tibble: 6 x 2
+    #>   type      name      
+    #>   <chr>     <fct>     
+    #> 1 Diseases  APC       
+    #> 2 Genes     APC       
+    #> 3 Diseases  Drosophila
+    #> 4 Species   Drosophila
+    #> 5 Diseases  IPMN      
+    #> 6 Chemicals IPMN
+
+This means that Pubtator listed *APC* both as a disease and a gene. This
+is realy not a bad prediction considering that this gene oringially
+recieved its name from the disease it was first discovered while
+studying: Adenomatous polyposis coli. However, the others are less
+forgivable. *Drosophila* is not a gene, it is a fruit fly,therefore,
+`"Species"` was the correct designation. IPMN stands for “intraductal
+papillary mucinous neoplasm” which is a benign tumor that can progress
+to pancreatic cancer (more information can be found at the [American
+Cancer Society’s
+website](https://www.cancer.org/cancer/pancreatic-cancer/about/what-is-pancreatic-cancer.html)).
+
+Finally, I manually removed the erroneous entries and made the join to
+complete the disease network.
+
+``` r
+tt %<>%
+    filter(!(type == "Diseases" & name == "APC")) %>% 
+    filter(!(type == "Diseases" & name == "Drosophila"))%>%
+    filter(!(type == "Chemicals" & name == "IPMN"))
+pub_gr <- pub_gr %N>%
+    left_join(tt, by = "name")
+```
+
+    #> # A tbl_graph: 1291 nodes and 6650 edges
+    #> #
+    #> # A bipartite multigraph with 13 components
+    #> #
+    #> # Node Data: 1,291 x 2 (active)
+    #>   name              type    
+    #>   <chr>             <chr>   
+    #> 1 cancer            Diseases
+    #> 2 ERK1/2            Genes   
+    #> 3 colorectal cancer Diseases
+    #> 4 CRC               Diseases
+    #> 5 tumour            Diseases
+    #> 6 AKT               Genes   
+    #> # … with 1,285 more rows
+    #> #
+    #> # Edge Data: 6,650 x 3
+    #>    from    to pmid    
+    #>   <int> <int> <chr>   
+    #> 1     1     2 30535440
+    #> 2     3     6 30103709
+    #> 3     4     6 30103709
+    #> # … with 6,647 more rows
+
+To begin visualizing the network, I plotted the largest component (which
+was almost all of the nodes). The nodes were colored by their type, and
+their size was associated with how many connections they made. The edge
+width and transparency was associated with the number of articles
+(PMIDs) that made the link.
+
+![](README_files/figure-gfm/plot_pubgr-1.png)<!-- -->
+
+A few things stood out to me. First, the network is incredibly dense.
+This is likely caused by the largse number of disease being highly
+redundant (ie. “colorectal cancer”, “COAD”, “CRC”). These would likely
+share a lot of the other entities, pulling the network tighter.
+
+Also, there are *way* more species than I would have predicted. **These
+warrant further investigation**.
+
+Considering only the diseases and genes
+
+![](README_files/figure-gfm/plot_pubgr2-1.png)<!-- -->
